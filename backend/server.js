@@ -90,6 +90,7 @@ app.delete('/api/purge', async (req, res) => {
 // The AI Processing Route (We will build the logic for this next!)
 // The AI Processing Route
 // The AI Processing Route
+// The AI Processing Route
 app.post('/api/process-policy', async (req, res) => {
   const { fileName } = req.body;
   
@@ -113,14 +114,12 @@ app.post('/api/process-policy', async (req, res) => {
 
     // 2. Extract Text
     console.log('📄 2. Extracting text from file...');
-    let extractedText = '';
+    let extractedText = ''; // <--- THIS IS THE VARIABLE
 
-    // Bulletproof extraction: Handles both true PDFs and plain text files pretending to be PDFs
     if (fileName.endsWith('.txt')) {
       extractedText = buffer.toString('utf-8');
     } else {
       try {
-        // Handle the Node.js import quirk
         const parseFunction = typeof pdfParse === 'function' ? pdfParse : pdfParse.default;
         const pdfResult = await parseFunction(buffer);
         extractedText = pdfResult.text;
@@ -133,19 +132,32 @@ app.post('/api/process-policy', async (req, res) => {
     // 3. Send to Gemini AI for mapping
     console.log('🧠 3. Sending to Gemini AI for ISO mapping...');
     const prompt = `
-      You are a strict Cybersecurity Compliance Auditor.
-      Analyze the following company policy text against the ISO 27001:2022 standard.
-      Identify which ISO 27001 controls this policy satisfies.
-      
-      Return ONLY a valid JSON array of objects. Do not write any markdown, explanations, or extra text.
-      Each object must have exactly these three keys:
-      - "policyName": "${fileName}"
-      - "controlId": The ISO control ID formatted exactly like "ISO_5_1" or "ISO_8_1"
-      - "label": "SATISFIES"
+You are a strict ISO 27001:2022 Cybersecurity Auditor. 
+Your ONLY job is to analyze the following document text and map it to the ISO 27001 controls it satisfies.
 
-      Policy Text to analyze:
-      ${extractedText.substring(0, 10000)}
-    `;
+DOCUMENT TEXT:
+"""
+${extractedText} 
+"""
+
+CRITICAL INSTRUCTIONS:
+1. You must output ONLY a valid, raw JSON object. 
+2. Do NOT include markdown formatting (like \`\`\`json). 
+3. Do NOT include any conversational text, greetings, or explanations.
+4. The JSON must perfectly match this exact schema:
+
+{
+  "nodes": [
+    { "id": "${fileName}", "name": "${fileName}", "group": 2 }
+  ],
+  "links": [
+    { "source": "${fileName}", "target": "ISO_5_1" },
+    { "source": "${fileName}", "target": "ISO_8_2" }
+  ]
+}
+
+Analyze the text and populate the "links" array with every ISO control you find. If you find none, return an empty links array.
+`;
 
     let response;
     let retries = 3;
@@ -156,14 +168,14 @@ app.post('/api/process-policy', async (req, res) => {
             model: 'gemini-2.5-flash',
             contents: prompt,
         });
-        break; // If successful, break out of the loop
+        break; 
       } catch (apiError) {
         if (apiError.status === 503 && retries > 1) {
           console.log(`⏳ Server busy. Retrying in 3 seconds... (${retries - 1} attempts left)`);
-          await new Promise(resolve => setTimeout(resolve, 3000)); // Wait 3 seconds
+          await new Promise(resolve => setTimeout(resolve, 3000));
           retries--;
         } else {
-          throw apiError; // If it's a different error, or we are out of retries, crash normally
+          throw apiError; 
         }
       }
     }
@@ -173,26 +185,29 @@ app.post('/api/process-policy', async (req, res) => {
         aiText = aiText.split('```json')[1].split('```')[0].trim();
     }
     
-    const mappings = JSON.parse(aiText);
-    console.log(`✨ AI found ${mappings.length} standard mappings!`);
+    // Parse the new JSON structure
+    const parsedData = JSON.parse(aiText);
+    const links = parsedData.links || [];
+    console.log(`✨ AI found ${links.length} standard mappings!`);
 
     // 4. Save to Neo4j
     console.log('🕸️ 4. Saving relationships to Neo4j Graph Database...');
     const session = driver.session();
     try {
+      // Updated Cypher query to match the new JSON schema
       const cypherQuery = `
-        UNWIND $mappings AS mapping
-        MERGE (p:Policy {id: mapping.policyName, name: mapping.policyName, group: 2})
-        MERGE (c:ISOControl {id: mapping.controlId, group: 1})
+        UNWIND $links AS link
+        MERGE (p:Policy {id: link.source, name: link.source, group: 2})
+        MERGE (c:ISOControl {id: link.target, group: 1})
         MERGE (p)-[:SATISFIES]->(c)
       `;
-      await session.run(cypherQuery, { mappings });
+      await session.run(cypherQuery, { links });
     } finally {
       await session.close();
     }
 
     console.log('✅ Processing Complete!\n');
-    res.json({ message: 'Successfully mapped policy to ISO standards!', mappings });
+    res.json({ message: 'Successfully mapped policy to ISO standards!', mappings: links });
 
   } catch (error) {
     console.error('❌ Error during processing:', error);
