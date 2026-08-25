@@ -76,7 +76,7 @@ app.get('/api/graph-data', async (req, res) => {
 app.delete('/api/purge', async (req, res) => {
   const session = driver.session();
   try {
-    // This Cypher query deletes ALL nodes and ALL relationships
+    // Deletes ALL nodes and ALL relationships
     await session.run('MATCH (n) DETACH DELETE n');
     res.json({ message: 'System Purged.' });
   } catch (error) {
@@ -87,10 +87,7 @@ app.delete('/api/purge', async (req, res) => {
   }
 });
 
-// The AI Processing Route (We will build the logic for this next!)
-// The AI Processing Route
-// The AI Processing Route
-// The AI Processing Route
+// --- AI PROCESSING ROUTE ---
 app.post('/api/process-policy', async (req, res) => {
   const { fileName } = req.body;
   
@@ -101,7 +98,7 @@ app.post('/api/process-policy', async (req, res) => {
   console.log(`\n--- Starting processing for: ${fileName} ---`);
 
   try {
-    // 1. Download PDF from Supabase
+    // 1. Download File from Supabase
     console.log('📥 1. Downloading from Supabase...');
     const { data: fileData, error: downloadError } = await supabase.storage
       .from('policies')
@@ -114,7 +111,7 @@ app.post('/api/process-policy', async (req, res) => {
 
     // 2. Extract Text
     console.log('📄 2. Extracting text from file...');
-    let extractedText = ''; // <--- THIS IS THE VARIABLE
+    let extractedText = '';
 
     if (fileName.endsWith('.txt')) {
       extractedText = buffer.toString('utf-8');
@@ -144,7 +141,11 @@ CRITICAL INSTRUCTIONS:
 1. You must output ONLY a valid, raw JSON object. 
 2. Do NOT include markdown formatting (like \`\`\`json). 
 3. Do NOT include any conversational text, greetings, or explanations.
-4. The JSON must perfectly match this exact schema:
+4. You MUST ONLY use valid ISO 27001:2022 control IDs. Section 5 ends at 5.37, Section 6 ends at 6.8, Section 7 ends at 7.14, and Section 8 ends at 8.34. NEVER invent a control ID that falls outside these ranges.
+5. If the document references legacy ISO 27001:2013 controls (e.g., A.5 through A.18), translate and map them to their modern ISO 27001:2022 equivalent (e.g., ISO_5_1 through ISO_8_34).
+6. Target IDs in the "links" array MUST use the format "ISO_X_Y" (e.g., "ISO_5_1", "ISO_8_2").
+7. The JSON must perfectly match this exact schema:
+
 
 {
   "nodes": [
@@ -156,7 +157,7 @@ CRITICAL INSTRUCTIONS:
   ]
 }
 
-Analyze the text and populate the "links" array with every ISO control you find. If you find none, return an empty links array.
+Analyze the text and populate the "links" array with every valid ISO control you find. If you find none, return an empty links array.
 `;
 
     let response;
@@ -165,8 +166,8 @@ Analyze the text and populate the "links" array with every ISO control you find.
     while (retries > 0) {
       try {
         response = await ai.models.generateContent({
-            model: 'gemini-2.5-flash',
-            contents: prompt,
+          model: 'gemini-2.5-flash',
+          contents: prompt,
         });
         break; 
       } catch (apiError) {
@@ -182,19 +183,34 @@ Analyze the text and populate the "links" array with every ISO control you find.
 
     let aiText = response.text.trim();
     if (aiText.startsWith('```json')) {
-        aiText = aiText.split('```json')[1].split('```')[0].trim();
+      aiText = aiText.split('```json')[1].split('```')[0].trim();
+    } else if (aiText.startsWith('```')) {
+      aiText = aiText.split('```')[1].split('```')[0].trim();
     }
     
-    // Parse the new JSON structure
+    // Parse the JSON structure
     const parsedData = JSON.parse(aiText);
-    const links = parsedData.links || [];
+    let rawLinks = parsedData.links || [];
+
+    // Helper to sanitize control IDs (e.g., "ISO_A.5.1" or "5.1" -> "ISO_5_1")
+    const sanitizeId = (id) => {
+      if (!id) return '';
+      const numbers = id.match(/\d+/g);
+      return numbers ? `ISO_${numbers.join('_')}` : id;
+    };
+
+    // Clean links before writing to Neo4j
+    const links = rawLinks.map(link => ({
+      source: link.source || fileName,
+      target: sanitizeId(link.target)
+    }));
+
     console.log(`✨ AI found ${links.length} standard mappings!`);
 
     // 4. Save to Neo4j
     console.log('🕸️ 4. Saving relationships to Neo4j Graph Database...');
     const session = driver.session();
     try {
-      // Updated Cypher query to match the new JSON schema
       const cypherQuery = `
         UNWIND $links AS link
         MERGE (p:Policy {id: link.source, name: link.source, group: 2})
@@ -214,6 +230,7 @@ Analyze the text and populate the "links" array with every ISO control you find.
     res.status(500).json({ error: error.message });
   }
 });
+
 // Start the Server
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {

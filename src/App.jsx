@@ -1,16 +1,62 @@
+import Auth from './Auth';
 import { useState, useRef, useEffect } from 'react'
 import { supabase } from './supabaseClient'
 import ForceGraph2D from 'react-force-graph-2d';
-import { BASE_STANDARDS } from './isoData'; // Importing the 93 controls
+import { BASE_STANDARDS } from './isoData';
 
 function App() {
+  
+  // --- AUTHENTICATION GATEKEEPER ---
+  const [session, setSession] = useState(null);
+
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setSession(session);
+    });
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      setSession(session);
+    });
+
+    return () => subscription.unsubscribe();
+  }, []);
+
+  // --- MOTIVATIONAL QUOTES LOGIC ---
+  const quotes = [
+    "Compliance is not the ceiling; it is the foundation.",
+    "We do not fear the unknown; we map it.",
+    "Vigilance is the ultimate firewall.",
+    "Security is a state of mind, not just a state of system.",
+    "In a world of variables, be the constant."
+  ];
+  const [quoteIndex, setQuoteIndex] = useState(0);
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setQuoteIndex((prev) => (prev + 1) % quotes.length);
+    }, 8000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // --- STANDARD APP STATE ---
   const [activeTab, setActiveTab] = useState('graph');
   const [file, setFile] = useState(null);
-  const [fileUrl, setFileUrl] = useState(null); // State for the Document Viewer
+  const [fileUrl, setFileUrl] = useState(null); 
   const [isUploading, setIsUploading] = useState(false);
   const [graphData, setGraphData] = useState({ nodes: BASE_STANDARDS, links: [] });
   const [isLoaded, setIsLoaded] = useState(false);
+  
+  // THEME ENGINE
+  const [theme, setTheme] = useState('dark'); 
+  const isDark = theme === 'dark';
+
   const fileInputRef = useRef(null);
+
+  const normalizeControlId = (str) => {
+    if (!str) return '';
+    const matches = str.match(/\d+/g);
+    return matches ? `ISO_${matches.join('_')}` : str;
+  };
 
   const fetchGraphData = async () => {
     try {
@@ -18,15 +64,20 @@ function App() {
       if (!response.ok) throw new Error("Backend not responding");
       const data = await response.json();
       
-      // THE FIX: Cross-reference DB nodes with our isoData.js to get the full detailed names
+      const sanitizedLinks = data.links.map(l => ({
+        source: l.source,
+        target: normalizeControlId(typeof l.target === 'object' ? l.target.id : l.target)
+      }));
+
       const hydratedDbNodes = data.nodes.map(dbNode => {
-        if (dbNode.group === 1) { // If it's an ISO control
-          const matchedStandard = BASE_STANDARDS.find(s => s.id === dbNode.id);
+        if (dbNode.group === 1) { 
+          const normDbId = normalizeControlId(dbNode.id);
+          const matchedStandard = BASE_STANDARDS.find(s => normalizeControlId(s.id) === normDbId);
           if (matchedStandard) {
-            return { ...dbNode, name: matchedStandard.name }; // Inject the full name
+            return { ...dbNode, id: matchedStandard.id, name: matchedStandard.name };
           }
         }
-        return dbNode; // Leave the Document node alone
+        return dbNode; 
       });
 
       const existingIds = new Set(hydratedDbNodes.map(n => n.id));
@@ -35,35 +86,38 @@ function App() {
         ...BASE_STANDARDS.filter(baseNode => !existingIds.has(baseNode.id))
       ];
 
-      setGraphData({ nodes: mergedNodes, links: data.links });
+      setGraphData({ nodes: mergedNodes, links: sanitizedLinks });
     } catch (error) {
       console.error("Failed to fetch graph data", error);
     }
   };
 
   useEffect(() => {
-    fetchGraphData();
-    setTimeout(() => setIsLoaded(true), 100);
-  }, []);
+    if (session) {
+      fetchGraphData();
+      setTimeout(() => setIsLoaded(true), 100);
+    }
+  }, [session]);
 
   const isoStandards = graphData.nodes.filter(node => node.group === 1);
   const coveredTargetIds = new Set(
-    graphData.links.map(link => typeof link.target === 'object' ? link.target.id : link.target)
+    graphData.links.map(link => {
+      const targetId = typeof link.target === 'object' ? link.target.id : link.target;
+      return normalizeControlId(targetId);
+    })
   );
-  const missedControls = isoStandards.filter(node => !coveredTargetIds.has(node.id));
+  const missedControls = isoStandards.filter(node => !coveredTargetIds.has(normalizeControlId(node.id)));
 
   const handleFileChange = (e) => {
     if (e.target.files && e.target.files[0]) {
       const selectedFile = e.target.files[0];
       setFile(selectedFile);
-      // Generate a local secure URL to preview the document instantly
       setFileUrl(URL.createObjectURL(selectedFile));
     }
   };
 
   const handleUpload = async () => {
     if (!file) return alert("Please select a file first!");
-
     try {
       setIsUploading(true);
       const fileExt = file.name.split('.').pop();
@@ -78,17 +132,13 @@ function App() {
         body: JSON.stringify({ fileName: fileName })
       });
 
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.error || "Backend AI processing failed");
-      }
+      if (!response.ok) throw new Error("Backend AI processing failed");
 
       await fetchGraphData(); 
       setActiveTab('graph'); 
       
     } catch (error) {
       alert("❌ Error: " + error.message);
-      console.error(error);
     } finally {
       setIsUploading(false);
     }
@@ -96,163 +146,210 @@ function App() {
 
   const handlePurge = async () => {
     if (!window.confirm("WARNING: This will wipe the entire Neo4j database. Proceed?")) return;
-    
     try {
       const response = await fetch('http://localhost:5000/api/purge', { method: 'DELETE' });
       if (!response.ok) throw new Error("Backend failed to purge.");
 
       setGraphData({ nodes: BASE_STANDARDS, links: [] });
       setFile(null);
-      setFileUrl(null); // Clear document viewer on purge
-      alert("✅ System Successfully Purged!");
-
+      setFileUrl(null); 
     } catch (error) {
       alert("❌ Purge Failed: " + error.message);
     }
   };
 
-  return (
-    <div className="min-h-screen bg-[#0a0a16] text-white flex flex-col font-sans overflow-y-auto selection:bg-cyan-500/30 custom-scrollbar">
-      
-      <div className="fixed top-[-10%] left-[-10%] w-[40vw] h-[40vw] rounded-full bg-cyan-900/20 blur-[120px] pointer-events-none z-0"></div>
-      <div className="fixed bottom-[-10%] right-[-10%] w-[40vw] h-[40vw] rounded-full bg-fuchsia-900/20 blur-[120px] pointer-events-none z-0"></div>
+  if (!session) {
+    return <Auth />;
+  }
 
-      <header className={`bg-black/40 backdrop-blur-xl border-b border-white/10 p-5 sticky top-0 z-20 transition-all duration-1000 transform ${isLoaded ? 'translate-y-0 opacity-100' : '-translate-y-full opacity-0'}`}>
+  // --- ULTRA-FLAT ENTERPRISE THEME CLASSES ---
+  const bgMain = isDark ? 'bg-slate-950 text-slate-200' : 'bg-slate-50 text-slate-800';
+  const panelClass = isDark ? 'bg-slate-900 border border-slate-800' : 'bg-white border border-slate-200 shadow-sm';
+  const headerClass = isDark ? 'bg-slate-950 border-b border-slate-800/60' : 'bg-white border-b border-slate-200';
+  const primaryText = isDark ? 'text-blue-500' : 'text-blue-600'; 
+  
+  return (
+    <div className={`min-h-screen flex flex-col font-sans overflow-y-auto selection:bg-blue-500/30 custom-scrollbar transition-colors duration-300 ${bgMain}`}>
+      
+      <header className={`px-6 py-4 sticky top-0 z-20 transition-all duration-500 transform ${headerClass} ${isLoaded ? 'translate-y-0 opacity-100' : '-translate-y-full opacity-0'}`}>
         <div className="max-w-7xl mx-auto flex items-center justify-between">
+          
+          {/* Flat Enterprise Logo & Title */}
           <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-cyan-400 to-blue-600 flex items-center justify-center shadow-[0_0_20px_rgba(34,211,238,0.4)]">
-              <svg className="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19.428 15.428a2 2 0 00-1.022-.547l-2.387-.477a6 6 0 00-3.86.517l-.318.158a6 6 0 01-3.86.517L6.05 15.21a2 2 0 00-1.806.547M8 4h8l-1 1v5.172a2 2 0 00.586 1.414l5 5c1.26 1.26.367 3.414-1.415 3.414H4.828c-1.782 0-2.674-2.154-1.414-3.414l5-5A2 2 0 009 10.172V5L8 4z"></path></svg>
-            </div>
+            <svg className={`w-8 h-8 ${primaryText}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"></path>
+            </svg>
             <div>
-              <h1 className="text-2xl font-black tracking-wider text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 to-fuchsia-400">NEXUS v2.0</h1>
-              <p className="text-[10px] tracking-[0.3em] text-cyan-500/70 uppercase font-bold">Enterprise Auditor</p>
+              <h1 className={`text-xl font-semibold tracking-tight ${isDark ? 'text-slate-100' : 'text-slate-900'}`}>Echo Valley</h1>
+              <p className="text-[10px] tracking-widest uppercase font-semibold text-slate-500">ISO 27001 Auditor</p>
             </div>
+          </div>
+
+          <div className="flex items-center gap-6">
+            {/* Clean Status Indicator */}
+            <p className="hidden md:block text-slate-500 italic text-sm font-medium">
+              "{quotes[quoteIndex]}"
+            </p>
+
+            <button 
+              onClick={() => supabase.auth.signOut()}
+              className={`px-4 py-2 rounded-md text-sm font-medium transition-all ${isDark ? 'text-slate-400 hover:text-slate-200 hover:bg-slate-800' : 'text-slate-500 hover:text-slate-800 hover:bg-slate-100'}`}
+            >
+              Sign Out
+            </button>
+
+            <button 
+              onClick={() => setTheme(isDark ? 'light' : 'dark')}
+              className={`p-2 rounded-md transition-all ${isDark ? 'text-slate-400 hover:text-slate-200 hover:bg-slate-800' : 'text-slate-400 hover:text-slate-800 hover:bg-slate-100'}`}
+              title="Toggle Theme"
+            >
+              {isDark ? (
+                <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20"><path fillRule="evenodd" d="M10 2a1 1 0 011 1v1a1 1 0 11-2 0V3a1 1 0 011-1zm4 8a4 4 0 11-8 0 4 4 0 018 0zm-.464 4.95l.707.707a1 1 0 001.414-1.414l-.707-.707a1 1 0 00-1.414 1.414zm2.12-10.607a1 1 0 010 1.414l-.706.707a1 1 0 11-1.414-1.414l.707-.707a1 1 0 011.414 0zM17 11a1 1 0 100-2h-1a1 1 0 100 2h1zm-7 4a1 1 0 011 1v1a1 1 0 11-2 0v-1a1 1 0 011-1zM5.05 6.464A1 1 0 106.465 5.05l-.708-.707a1 1 0 00-1.414 1.414l.707.707zm1.414 8.486l-.707.707a1 1 0 01-1.414-1.414l.707-.707a1 1 0 011.414 1.414zM4 11a1 1 0 100-2H3a1 1 0 000 2h1z" clipRule="evenodd"></path></svg>
+              ) : (
+                <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20"><path d="M17.293 13.293A8 8 0 016.707 2.707a8.001 8.001 0 1010.586 10.586z"></path></svg>
+              )}
+            </button>
           </div>
         </div>
       </header>
 
-      <main className="flex-grow p-6 md:p-8 max-w-7xl mx-auto w-full flex flex-col gap-8 relative z-10">
+      <main className="flex-grow p-6 max-w-7xl mx-auto w-full flex flex-col gap-6 relative z-10">
         
-        {/* TOP ROW: Controls & Visuals */}
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
           
-          {/* Left Column: Upload */}
-          <div className={`col-span-1 flex flex-col gap-6 transition-all duration-1000 delay-300 transform ${isLoaded ? 'translate-x-0 opacity-100' : '-translate-x-20 opacity-0'}`}>
-            <div className="bg-white/5 backdrop-blur-lg p-7 rounded-2xl border border-white/10 shadow-2xl relative overflow-hidden group">
-              <div className="flex items-center gap-3 mb-6 relative z-10">
-                <div className="bg-cyan-500/20 text-cyan-400 w-8 h-8 rounded-full flex items-center justify-center font-bold text-sm border border-cyan-500/30">1</div>
-                <h2 className="text-lg font-bold text-slate-200 tracking-wide">Data Ingestion</h2>
+          {/* Left Column: Upload Panel */}
+          <div className={`col-span-1 flex flex-col gap-6 transition-all duration-700 transform ${isLoaded ? 'translate-x-0 opacity-100' : '-translate-x-10 opacity-0'}`}>
+            <div className={`p-6 rounded-xl ${panelClass}`}>
+              <div className="flex items-center gap-3 mb-6">
+                <h2 className={`text-base font-semibold ${isDark ? 'text-slate-100' : 'text-slate-900'}`}>Policy Ingestion</h2>
               </div>
               
               <div 
-                className="relative z-10 border-2 border-dashed border-cyan-500/30 rounded-xl p-8 text-center bg-black/40 hover:bg-cyan-950/30 hover:border-cyan-400 transition-all cursor-pointer duration-300"
+                className={`border border-dashed rounded-lg p-8 text-center cursor-pointer transition-all duration-200 ${isDark ? 'border-slate-700 hover:border-slate-500 hover:bg-slate-800/50' : 'border-slate-300 hover:border-slate-400 hover:bg-slate-50'}`}
                 onClick={() => fileInputRef.current.click()}
               >
                 <input type="file" ref={fileInputRef} onChange={handleFileChange} accept=".pdf,.txt" className="hidden" />
                 {file ? (
                   <div className="flex flex-col items-center">
-                    <div className="w-16 h-16 rounded-full bg-cyan-500/20 flex items-center justify-center mb-4 border border-cyan-500/50"><svg className="w-8 h-8 text-cyan-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg></div>
-                    <p className="text-cyan-300 font-semibold truncate w-full px-4">{file.name}</p>
+                    <svg className={`w-10 h-10 mb-3 ${primaryText}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                    <p className={`font-medium text-sm truncate w-full px-2 ${isDark ? 'text-slate-300' : 'text-slate-700'}`}>{file.name}</p>
                   </div>
                 ) : (
-                  <div className="flex flex-col items-center text-slate-400">
-                    <svg className="w-14 h-14 mb-4 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"></path></svg>
-                    <p className="font-medium tracking-wide">Drop payload here</p>
-                    <p className="text-xs mt-2 text-slate-500 uppercase tracking-widest">TXT / PDF</p>
+                  <div className="flex flex-col items-center text-slate-500">
+                    <svg className="w-10 h-10 mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"></path></svg>
+                    <p className="font-medium text-sm">Click to select document</p>
+                    <p className="text-xs mt-1">Supports .TXT or .PDF</p>
                   </div>
                 )}
               </div>
               
-              <div className="mt-8 relative z-10">
+              <div className="mt-6 flex flex-col gap-3">
                 <button 
                   onClick={handleUpload} disabled={!file || isUploading}
-                  className={`w-full px-4 py-4 rounded-xl font-bold tracking-widest uppercase text-sm transition-all duration-300 flex justify-center items-center gap-3 border ${!file || isUploading ? 'bg-white/5 text-slate-500 border-white/5 cursor-not-allowed' : 'bg-cyan-500/10 text-cyan-400 border-cyan-500/50 hover:bg-cyan-500 hover:text-black'}`}
+                  className={`w-full py-2.5 rounded-md font-medium text-sm transition-all duration-200 ${!file || isUploading ? (isDark ? 'bg-slate-800 text-slate-500 cursor-not-allowed' : 'bg-slate-100 text-slate-400 cursor-not-allowed') : 'bg-blue-600 hover:bg-blue-700 text-white'}`}
                 >
-                  {isUploading ? "Executing Analysis..." : "Initialize AI"}
+                  {isUploading ? "Processing Document..." : "Initialize Analysis"}
                 </button>
                 <button 
                   onClick={handlePurge}
-                  className="mt-4 w-full px-4 py-3 rounded-xl font-bold tracking-widest uppercase text-xs transition-all duration-300 border bg-red-500/5 text-red-500 border-red-500/30 hover:bg-red-500 hover:text-black flex justify-center items-center gap-2"
+                  className={`w-full py-2.5 rounded-md font-medium text-sm transition-all duration-200 border ${isDark ? 'bg-transparent border-red-900/30 text-red-500 hover:bg-red-900/20' : 'bg-transparent border-red-200 text-red-600 hover:bg-red-50'}`}
                 >
-                  Purge Database
+                  Clear Database
                 </button>
               </div>
             </div>
           </div>
 
-          {/* Right Column: Graphs & Reports */}
-          <div className={`lg:col-span-2 bg-white/5 backdrop-blur-lg p-7 rounded-2xl border border-white/10 shadow-2xl flex flex-col h-[600px] transition-all duration-1000 delay-500 transform ${isLoaded ? 'translate-y-0 opacity-100' : 'translate-y-20 opacity-0'}`}>
-            <div className="flex bg-black/40 p-1.5 rounded-xl mb-6 w-max border border-white/5 relative">
-              <div className={`absolute top-1.5 bottom-1.5 w-[160px] bg-gradient-to-r from-cyan-500 to-blue-500 rounded-lg transition-transform duration-500 ease-out ${activeTab === 'graph' ? 'translate-x-0' : 'translate-x-full'}`}></div>
-              <button className={`relative z-10 w-[160px] py-2.5 text-sm font-bold tracking-wide rounded-lg transition-colors duration-300 ${activeTab === 'graph' ? 'text-white' : 'text-slate-400 hover:text-slate-200'}`} onClick={() => setActiveTab('graph')}>Neural Topology</button>
-              <button className={`relative z-10 w-[160px] py-2.5 text-sm font-bold tracking-wide rounded-lg transition-colors duration-300 flex items-center justify-center gap-2 ${activeTab === 'report' ? 'text-white' : 'text-slate-400 hover:text-slate-200'}`} onClick={() => setActiveTab('report')}>
-                Detailed Gap Report
-                {missedControls.length > 0 && <span className={`flex items-center justify-center w-5 h-5 rounded-full text-[10px] font-black transition-colors duration-300 ${activeTab === 'report' ? 'bg-white/20 text-white' : 'bg-red-500/20 text-red-400 border border-red-500/30'}`}>{missedControls.length}</span>}
+          {/* Right Column: Visualizations */}
+          <div className={`lg:col-span-2 p-6 rounded-xl flex flex-col h-[600px] transition-all duration-700 transform ${panelClass} ${isLoaded ? 'translate-y-0 opacity-100' : 'translate-y-10 opacity-0'}`}>
+            
+            <div className={`flex border-b mb-4 pb-2 ${isDark ? 'border-slate-800' : 'border-slate-200'}`}>
+              <button 
+                className={`px-4 py-2 text-sm font-medium transition-colors ${activeTab === 'graph' ? primaryText : 'text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'}`} 
+                onClick={() => setActiveTab('graph')}
+              >
+                Neural Topology
+              </button>
+              <button 
+                className={`px-4 py-2 text-sm font-medium flex items-center gap-2 transition-colors ${activeTab === 'report' ? primaryText : 'text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'}`} 
+                onClick={() => setActiveTab('report')}
+              >
+                Gap Analysis Report
+                {missedControls?.length > 0 && (
+                  <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold ${activeTab === 'report' ? 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400' : 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400'}`}>
+                    {missedControls.length}
+                  </span>
+                )}
               </button>
             </div>
 
-            <div className="flex-grow bg-black/60 rounded-xl border border-white/5 overflow-hidden relative shadow-inner">
+            {/* Seamless Graph Container without borders */}
+            <div className="flex-grow relative overflow-hidden">
               {activeTab === 'graph' && (
-                <div className="absolute inset-0 animate-[fadeIn_0.5s_ease-out]">
+                <div className="absolute inset-0">
                   <ForceGraph2D
-                    graphData={graphData} width={800} height={480} nodeAutoColorBy="group" nodeRelSize={8} linkDirectionalArrowLength={6} linkDirectionalArrowRelPos={1} linkColor={() => 'rgba(255,255,255,0.2)'} backgroundColor="#00000000"
+                    graphData={graphData} 
+                    width={800} height={480} 
+                    nodeAutoColorBy="group" 
+                    nodeRelSize={6} 
+                    linkDirectionalArrowLength={5} 
+                    linkDirectionalArrowRelPos={1} 
+                    linkColor={() => isDark ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.1)'} 
+                    backgroundColor="#00000000"
                     nodeCanvasObject={(node, ctx, globalScale) => {
-  const label = node.name || node.id; 
-  const fontSize = 13/globalScale; 
-  ctx.font = `600 ${fontSize}px Inter, Sans-Serif`; 
-  const textWidth = ctx.measureText(label).width; 
-  const bckgDimensions = [textWidth, fontSize].map(n => n + fontSize * 0.8);
-  
-  // --- THE NEW VISUAL LOGIC ---
-  const isISO = node.group === 1; 
-  
-  // Check if this node is in the missing/gap list
-  const isMissed = isISO && !coveredTargetIds.has(node.id); 
+                      const label = node.name || node.id; 
+                      const fontSize = 12/globalScale; 
+                      ctx.font = `500 ${fontSize}px Inter, sans-serif`; 
+                      const textWidth = ctx.measureText(label).width; 
+                      const bckgDimensions = [textWidth, fontSize].map(n => n + fontSize * 1.2);
+                      
+                      const isISO = node.group === 1; 
+                      const isMissed = isISO && !coveredTargetIds.has(normalizeControlId(node.id)); 
 
-  // If it's a missed ISO, color it RED. If mapped, CYAN. If it's the Document, FUCHSIA.
-  const mainColor = isISO ? (isMissed ? '#ef4444' : '#22d3ee') : '#e879f9'; 
-  const bgColor = isISO ? (isMissed ? 'rgba(69, 10, 10, 0.9)' : 'rgba(8, 51, 68, 0.9)') : 'rgba(74, 4, 78, 0.9)';
-  // ----------------------------
-
-  ctx.fillStyle = bgColor; 
-  ctx.beginPath(); 
-  ctx.roundRect(node.x - bckgDimensions[0] / 2, node.y - bckgDimensions[1] / 2, bckgDimensions[0], bckgDimensions[1], 4/globalScale); 
-  ctx.fill();
-  ctx.strokeStyle = mainColor; 
-  ctx.lineWidth = 1/globalScale; 
-  ctx.stroke();
-  ctx.textAlign = 'center'; 
-  ctx.textBaseline = 'middle'; 
-  ctx.fillStyle = '#ffffff'; 
-  ctx.fillText(label, node.x, node.y);
-}}
+                      const mainColor = isISO ? (isMissed ? '#ef4444' : '#10b981') : '#3b82f6'; 
+                      const bgColorDark = isISO ? (isMissed ? '#450a0a' : '#022c22') : '#1e3a8a';
+                      const bgColorLight = isISO ? (isMissed ? '#fef2f2' : '#f0fdf4') : '#eff6ff';
+                      
+                      ctx.fillStyle = isDark ? bgColorDark : bgColorLight; 
+                      ctx.beginPath(); 
+                      ctx.roundRect(node.x - bckgDimensions[0] / 2, node.y - bckgDimensions[1] / 2, bckgDimensions[0], bckgDimensions[1], 4/globalScale); 
+                      ctx.fill();
+                      ctx.strokeStyle = mainColor; 
+                      ctx.lineWidth = 1.5/globalScale; 
+                      ctx.stroke();
+                      ctx.textAlign = 'center'; 
+                      ctx.textBaseline = 'middle'; 
+                      
+                      ctx.fillStyle = isDark ? '#f8fafc' : '#0f172a'; 
+                      ctx.fillText(label, node.x, node.y);
+                    }}
                   />
                 </div>
               )}
 
               {activeTab === 'report' && (
-                <div className="w-full h-full p-8 overflow-y-auto custom-scrollbar animate-[fadeIn_0.5s_ease-out]">
+                <div className="w-full h-full p-2 overflow-y-auto custom-scrollbar">
                   {missedControls.length > 0 ? (
-                    <div className="space-y-6">
+                    <div className="space-y-4">
                       {missedControls.map((control) => (
-                        <div key={control.id} className="p-6 bg-red-950/20 border border-red-500/30 rounded-xl relative overflow-hidden">
-                          <div className="absolute left-0 top-0 bottom-0 w-1.5 bg-red-500"></div>
-                          <div className="flex justify-between items-start mb-3">
-                            <h4 className="text-xl font-bold text-white">{control.id.replace('_', ' ')}: {control.name.split(' ').slice(1).join(' ')}</h4>
-                            <span className="px-3 py-1 bg-red-500/20 text-red-400 border border-red-500/50 text-xs font-black tracking-widest uppercase rounded">Critical Gap</span>
+                        <div key={control.id} className={`p-5 rounded-lg border ${isDark ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
+                          <div className="flex justify-between items-start mb-2">
+                            <h4 className={`text-sm font-semibold ${isDark ? 'text-slate-200' : 'text-slate-800'}`}>
+                              {control.id.replace('_', ' ')}: {control.name.split(' ').slice(1).join(' ')}
+                            </h4>
+                            <span className={`px-2 py-1 border text-[10px] font-semibold uppercase tracking-wider rounded ${isDark ? 'bg-red-900/20 text-red-400 border-red-800/50' : 'bg-red-50 text-red-600 border-red-200'}`}>Flagged Gap</span>
                           </div>
-                          {/* DETAILED REMEDIATION SECTION */}
-                          <div className="mt-4 p-4 bg-black/40 rounded-lg border border-white/5">
-                            <p className="text-sm font-bold text-slate-300 uppercase tracking-widest mb-2">Recommended Remediation:</p>
-                            <p className="text-slate-400 text-sm leading-relaxed">{control.remediation}</p>
+                          <div className={`mt-3 p-4 rounded-md ${isDark ? 'bg-slate-950/50' : 'bg-slate-50'}`}>
+                            <p className={`text-[10px] font-semibold uppercase tracking-wider mb-1 ${isDark ? 'text-slate-500' : 'text-slate-400'}`}>Remediation Note</p>
+                            <p className={`text-sm ${isDark ? 'text-slate-400' : 'text-slate-600'}`}>{control.remediation}</p>
                           </div>
                         </div>
                       ))}
                     </div>
                   ) : (
                     <div className="flex flex-col items-center justify-center h-full text-center">
-                      <h3 className="text-3xl font-black text-transparent bg-clip-text bg-gradient-to-r from-emerald-400 to-cyan-400">Compliance Verified</h3>
-                      <p className="text-slate-400 mt-3">All 93 ISO controls mapped successfully.</p>
+                      <h3 className={`text-xl font-semibold ${primaryText}`}>Compliance Verified</h3>
+                      <p className={`mt-2 text-sm ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>No structural gaps identified in the current policy scope.</p>
                     </div>
                   )}
                 </div>
@@ -261,22 +358,18 @@ function App() {
           </div>
         </div>
 
-        {/* BOTTOM ROW: Dynamic Document Viewer */}
+        {/* BOTTOM ROW: Document Viewer */}
         {fileUrl && (
-          <div className="w-full bg-white/5 backdrop-blur-lg p-7 rounded-2xl border border-white/10 shadow-2xl transition-all duration-1000 animate-[fadeIn_0.5s_ease-out]">
-            <div className="flex items-center gap-3 mb-6">
-              <div className="bg-fuchsia-500/20 text-fuchsia-400 w-8 h-8 rounded-full flex items-center justify-center font-bold text-sm border border-fuchsia-500/30">
-                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"></path></svg>
+          <div className={`w-full p-6 rounded-xl transition-all duration-700 ${panelClass}`}>
+            <div className="flex items-center gap-3 mb-4">
+              <div className={`w-8 h-8 rounded flex items-center justify-center ${isDark ? 'bg-slate-800 border border-slate-700' : 'bg-slate-100'}`}>
+                <svg className={`w-4 h-4 ${primaryText}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path></svg>
               </div>
-              <h2 className="text-lg font-bold text-slate-200 tracking-wide">Active Document Source: <span className="text-fuchsia-400 font-mono ml-2">{file?.name}</span></h2>
+              <h2 className={`text-sm font-semibold ${isDark ? 'text-slate-200' : 'text-slate-800'}`}>Source Document: <span className="font-normal text-slate-500 ml-1">{file?.name}</span></h2>
             </div>
             
-            <div className="bg-black/60 rounded-xl border border-white/5 overflow-hidden h-[800px]">
-              <iframe 
-                src={fileUrl} 
-                className="w-full h-full"
-                title="Document Viewer"
-              />
+            <div className={`rounded-lg border overflow-hidden h-[800px] ${isDark ? 'bg-slate-950 border-slate-800' : 'bg-slate-50 border-slate-200'}`}>
+              <iframe src={fileUrl} className="w-full h-full" title="Document Viewer" />
             </div>
           </div>
         )}
@@ -284,11 +377,12 @@ function App() {
       </main>
       
       <style>{`
-        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
-        .custom-scrollbar::-webkit-scrollbar { width: 8px; }
-        .custom-scrollbar::-webkit-scrollbar-track { background: rgba(0,0,0,0.3); }
-        .custom-scrollbar::-webkit-scrollbar-thumb { background: rgba(34, 211, 238, 0.3); border-radius: 10px; }
-        .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: rgba(34, 211, 238, 0.6); }
+        .custom-scrollbar::-webkit-scrollbar { width: 6px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 10px; }
+        .dark .custom-scrollbar::-webkit-scrollbar-thumb { background: #334155; }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+        .dark .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #475569; }
       `}</style>
     </div>
   )
